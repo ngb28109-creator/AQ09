@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NB09 ROV - Trạm Điều Hành & Bản Đồ WQI</title>
+    <!-- Leaflet CSS & JS (Bản đồ) -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: Arial, sans-serif; }
+        body { background: #0f172a; color: #fff; padding: 10px; }
+        .header { text-align: center; padding: 10px; background: #1e293b; border-radius: 8px; margin-bottom: 10px; }
+        .btn-btn { padding: 10px 15px; border: none; border-radius: 5px; font-weight: bold; cursor: pointer; margin: 5px; }
+        .btn-connect { background: #22c55e; color: #fff; }
+        .btn-cam { background: #3b82f6; color: #fff; }
+        .grid-container { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        @media (max-width: 600px) { .grid-container { grid-template-columns: 1fr; } }
+        .card { background: #1e293b; border-radius: 8px; padding: 10px; }
+        #camera-container { position: relative; width: 100%; height: 240px; background: #000; overflow: hidden; border-radius: 6px; }
+        video, canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; }
+        #map { width: 100%; height: 250px; border-radius: 6px; }
+        .data-display { display: flex; justify-content: space-around; margin-top: 10px; text-align: center; }
+        .data-box { background: #334155; padding: 8px; border-radius: 6px; flex: 1; margin: 2px; }
+        .data-val { font-size: 1.2rem; font-weight: bold; color: #38bdf8; }
+        .log-box { font-family: monospace; font-size: 0.8rem; height: 80px; overflow-y: auto; background: #020617; padding: 5px; border-radius: 4px; color: #4ade80; }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h2>NB09 ROV COMMAND CENTER</h2>
+        <button id="btnConnectSerial" class="btn-btn btn-connect">🔌 Cắm USB LoRa & Kết Nối</button>
+        <button id="btnStartCamera" class="btn-btn btn-cam">📷 Bật Cam Điện Thoại</button>
+    </div>
+
+    <div class="grid-container">
+        <!-- KHỐI 1: CAMERA & CHỈ ĐƯỜNG TỰ ĐỘNG -->
+        <div class="card">
+            <h3>📷 Thị Giác Định Vị (Auto-Docking)</h3>
+            <div id="camera-container">
+                <video id="webcam" autoplay playsinline></video>
+                <canvas id="canvasOverlay"></canvas>
+            </div>
+            <p style="margin-top:5px; font-size:0.9rem;">
+                Lệnh gửi ROV: <span id="cmdSent" style="font-weight:bold; color:#facc15;">WAITING</span>
+            </p>
+        </div>
+
+        <!-- KHỐI 2: BẢN ĐỒ VỊ TRÍ & DỮ LIỆU WQI -->
+        <div class="card">
+            <h3>🗺️ Bản Đồ Quan Trắc WQI Realtime</h3>
+            <div id="map"></div>
+        </div>
+    </div>
+
+    <!-- KHỐI 3: HIỂN THỊ CHỈ SỐ VÀ ĐỒ THỊ -->
+    <div class="card" style="margin-top: 10px;">
+        <h3>📊 Chỉ Số Dữ Liệu Thu Thập Được</h3>
+        <div class="data-display">
+            <div class="data-box">Độ Sâu Max<div id="valDepth" class="data-val">0.0 m</div></div>
+            <div class="data-box">TDS Max<div id="valTDS" class="data-val">0 ppm</div></div>
+            <div class="data-box">Độ Đục Max<div id="valTurb" class="data-val">0 NTU</div></div>
+            <div class="data-box">Đánh Giá WQI<div id="valWQI" class="data-val" style="color:#22c55e;">TỐT</div></div>
+        </div>
+        <h4 style="margin-top:10px;">Thống Kê Dữ Liệu Telemetry:</h4>
+        <div id="logConsole" class="log-box">Hệ thống sẵn sàng...</div>
+    </div>
+
+    <script>
+        // ==================== 1. KHỞI TẠO BẢN ĐỒ LEAFLET ====================
+        const map = L.map('map').setView([20.8, 105.8], 16); 
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+
+        navigator.geolocation.getCurrentPosition(pos => {
+            const lat = pos.coords.latitude;
+            const lng = pos.coords.longitude;
+            map.setView([lat, lng], 18);
+            L.marker([lat, lng]).addTo(map).bindPopup("Trạm Bờ (Điện thoại)").openPopup();
+        });
+
+        // ==================== 2. WEB SERIAL API (KẾT NỐI ĂNG-TEN LORA USB) ====================
+        let port, reader, writer;
+
+        document.getElementById('btnConnectSerial').addEventListener('click', async () => {
+            try {
+                port = await navigator.serial.requestPort();
+                await port.open({ baudRate: 115200 });
+                log("🔌 Đã kết nối thành công với USB-LoRa!");
+                
+                writer = port.writable.getWriter();
+                readSerialData();
+            } catch (err) {
+                log("❌ Lỗi kết nối Serial: " + err);
+            }
+        });
+
+        async function readSerialData() {
+            const textDecoder = new TextDecoderStream();
+            const readableStreamClosed = port.readable.pipeTo(textDecoder.writable);
+            reader = textDecoder.readable.getReader();
+
+            let buffer = "";
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) { reader.releaseLock(); break; }
+                if (value) {
+                    buffer += value;
+                    let lines = buffer.split('\n');
+                    buffer = lines.pop();
+                    for (let line of lines) {
+                        processLoraPayload(line.trim());
+                    }
+                }
+            }
+        }
+
+        function processLoraPayload(payload) {
+            log("📥 NỘI DUNG LORA: " + payload);
+            if (payload.includes("PAYLOAD LORA")) {
+                const depthMatch = payload.match(/Độ sâu max:\s*([\d.]+)/);
+                const tdsMatch   = payload.match(/TDS max:\s*([\d.]+)/);
+                const turbMatch  = payload.match(/Độ đục max:\s*([\d.]+)/);
+
+                if (depthMatch && tdsMatch && turbMatch) {
+                    const depth = parseFloat(depthMatch[1]);
+                    const tds   = parseFloat(tdsMatch[1]);
+                    const turb  = parseFloat(turbMatch[1]);
+
+                    document.getElementById('valDepth').innerText = depth.toFixed(2) + " m";
+                    document.getElementById('valTDS').innerText   = tds.toFixed(0) + " ppm";
+                    document.getElementById('valTurb').innerText  = turb.toFixed(0) + " NTU";
+
+                    let wqiText = "TỐT";
+                    let color = "#22c55e";
+                    if (tds > 500 || turb > 100) { wqiText = "TRUNG BÌNH"; color = "#eab308"; }
+                    if (tds > 1000 || turb > 250) { wqiText = "Ô NHIỄM"; color = "#ef4444"; }
+                    
+                    const wqiEl = document.getElementById('valWQI');
+                    wqiEl.innerText = wqiText;
+                    wqiEl.style.color = color;
+
+                    navigator.geolocation.getCurrentPosition(pos => {
+                        const marker = L.circleMarker([pos.coords.latitude, pos.coords.longitude], {
+                            color: color, radius: 8
+                        }).addTo(map);
+                        marker.bindPopup(`<b>Kết quả lặn:</b><br>Độ sâu: ${depth}m<br>TDS: ${tds} ppm<br>Độ đục: ${turb} NTU`).openPopup();
+                    });
+                }
+            }
+        }
+
+        async function sendLoraCommand(cmdChar) {
+            if (writer) {
+                await writer.write(new TextEncoder().encode(cmdChar));
+                document.getElementById('cmdSent').innerText = "LỆNH: " + cmdChar;
+            }
+        }
+
+        // ==================== 3. KHỐI THỊ GIÁC CAMERA & TÍNH TOÁN ====================
+        const video = document.getElementById('webcam');
+        const canvas = document.getElementById('canvasOverlay');
+        const ctx = canvas.getContext('2d');
+
+        document.getElementById('btnStartCamera').addEventListener('click', async () => {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: "environment", width: 640, height: 480 }
+                });
+                video.srcObject = stream;
+                log("📷 Camera điện thoại đã khởi động!");
+                requestAnimationFrame(processCameraFrame);
+            } catch (err) {
+                log("❌ Lỗi mở Camera: " + err);
+            }
+        });
+
+        let lastCmdTime = 0;
+        function processCameraFrame() {
+            if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+                const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                const data = imgData.data;
+                let maxBrightness = 0;
+                let targetX = -1, targetY = -1;
+
+                for (let i = 0; i < data.length; i += 16) {
+                    let r = data[i], g = data[i+1], b = data[i+2];
+                    let brightness = (r + g + b) / 3;
+                    if (brightness > maxBrightness && brightness > 200) {
+                        maxBrightness = brightness;
+                        let pixelIndex = i / 4;
+                        targetX = pixelIndex % canvas.width;
+                        targetY = Math.floor(pixelIndex / canvas.width);
+                    }
+                }
+
+                const centerX = canvas.width / 2;
+                ctx.strokeStyle = '#00ff00';
+                ctx.lineWidth = 2;
+                ctx.strokeRect(centerX - 40, 0, 80, canvas.height);
+
+                if (targetX !== -1) {
+                    ctx.fillStyle = '#ef4444';
+                    ctx.beginPath();
+                    ctx.arc(targetX, targetY, 10, 0, 2 * Math.PI);
+                    ctx.fill();
+
+                    if (Date.now() - lastCmdTime > 300) {
+                        lastCmdTime = Date.now();
+                        if (targetX < centerX - 40) {
+                            sendLoraCommand('L');
+                        } else if (targetX > centerX + 40) {
+                            sendLoraCommand('R');
+                        } else {
+                            sendLoraCommand('F');
+                        }
+                    }
+                }
+            }
+            requestAnimationFrame(processCameraFrame);
+        }
+
+        function log(msg) {
+            const consoleEl = document.getElementById('logConsole');
+            consoleEl.innerHTML += "<div>" + msg + "</div>";
+            consoleEl.scrollTop = consoleEl.scrollHeight;
+        }
+    </script>
+</body>
+</html>
